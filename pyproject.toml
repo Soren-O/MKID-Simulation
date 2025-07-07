@@ -1,0 +1,34 @@
+[project]
+name = "qp-simulator"
+version = "1.1.0"
+description = "A numerical solver for quasiparticle dynamics in superconductors."
+authors = [{name = "Soren Ormseth"}]
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = [
+    "numpy>=1.20.0",
+    "scipy>=1.7.0",
+    "matplotlib>=3.3.0",
+    "tqdm>=4.60.0"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0.0",
+    "pytest-cov>=2.10.0",
+    "flake8>=3.8.0",
+    "black>=21.0",
+    "isort>=5.0.0",
+    "ipython>=7.0.0",
+    "notebook>=6.0.0"
+]
+
+[tool.setuptools]
+packages = ["qp_simulator"]

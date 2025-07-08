@@ -16,14 +16,19 @@ This module does not have treatment of:
 - Effective force due to the spatially varying gap-parameter
 - Self-consistent gap equation changing the gap-parameter due to changes in quasiparticle density
 
-Note: This implementation internally uses dimensionless density n(E,x) = ρ(E,x)f(E,x). Physical quantities (total QPs, etc.) are obtained by multiplying
+This module:
+- Uses the Crank-Nicolson Algorithm in combination with the Thomas Algorithm for quasiparticle diffusion
+- Uses an explicit time step method for the collision integrals
+
+Note: 
+This implementation internally uses dimensionless density n(E,x) = ρ(E,x)f(E,x). Physical quantities (total QPs, etc.) are obtained by multiplying
 by 4N₀ where needed. 
 
 For validation and analysis tools, see qp_validation.py
 For usage examples, see the notebooks/examples folder
 
 Author: Soren Ormseth
-Version: 1.0.0
+Version: 1.0.1
 """
 
 import numpy as np
@@ -31,7 +36,6 @@ import matplotlib.pyplot as plt
 from IPython.display import clear_output
 import time
 from scipy.constants import physical_constants as pyc
-from scipy.integrate import solve_ivp
 from dataclasses import dataclass
 from typing import Callable, Tuple, Optional
 import warnings
@@ -39,17 +43,14 @@ import logging
 
 # Optional progress bar with graceful fallback
 try:
-    from tqdm.auto import tqdm #tdqm.auto picks the progress-bar best for your environmet (Jupyter notebook vs terminal)
+    from tqdm.auto import tqdm  # tqdm.auto picks the progress-bar best for your environment (Jupyter notebook vs terminal)
 except ImportError:
     def tqdm(iterable, **kwargs):
-        return iterable #if tqdm is unavailable then when you call it this will just give you back the original iterable
+        return iterable  # if tqdm is unavailable then when you call it this will just give you back the original iterable
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Global constants
-EPS_ENERGY = 1e-30  # eV² - prevents division by zero in energy products
 
 # ============================================================================
 # Data Classes for Parameters
@@ -58,8 +59,7 @@ EPS_ENERGY = 1e-30  # eV² - prevents division by zero in energy products
 @dataclass
 class MaterialParameters:
     """Physical parameters of the superconductor material"""
-    tau_s: float  # Electron-phonon scattering time (ns)
-    tau_r: float  # Electron-phonon recombination time (ns)
+    tau_0: float  # Characteristic electron-phonon time (ns)
     D_0: float    # Normal state diffusion coefficient (μm²/ns)
     T_c: float    # Critical temperature (K)
     gamma: float  # Dynes broadening parameter (eV)
@@ -67,8 +67,8 @@ class MaterialParameters:
     
     def validate(self):
         """Validate physical parameters"""
-        if self.tau_s <= 0 or self.tau_r <= 0:
-            raise ValueError("Scattering times must be positive")
+        if self.tau_0 <= 0:
+            raise ValueError("Characteristic time must be positive")
         if self.D_0 <= 0:
             raise ValueError("Diffusion coefficient must be positive")
         if self.T_c <= 0:
@@ -89,8 +89,6 @@ class SimulationParameters:
     E_min: float # Minimum energy (eV)
     E_max: float # Maximum energy (eV)
     verbose: bool = False  # Enable progress bars
-    rtol: float = 1e-8     # Relative tolerance for implicit solver
-    atol: float = 1e-12    # Absolute tolerance for implicit solver
     
     def validate(self):
         """Validate simulation parameters"""
@@ -138,7 +136,6 @@ class InjectionParameters:
 class SuperconductorGeometry:
     """
     Handles spatial discretization and gap profile.
-    This version pre-calculates gap arrays for improved performance.
     """
 
     def __init__(self, L: float, nx: int, gap_function: Callable[[float], float]):
@@ -151,13 +148,9 @@ class SuperconductorGeometry:
         self.x_centers = (np.arange(nx) + 0.5) * self.dx
         self.x_boundaries = np.arange(nx + 1) * self.dx
 
-        # --- Pre-calculate and cache gap arrays ---
-        # Create a vectorized version of the gap function once.
-        vec_gap = np.vectorize(self.gap_function)
-
         # Calculate the gap arrays and store them as private attributes.
-        self._gap_array_centers = vec_gap(self.x_centers)
-        self._gap_array_boundaries = vec_gap(self.x_boundaries[1:-1])
+        self._gap_array_centers = np.vectorize(self.gap_function)(self.x_centers)
+        self._gap_array_boundaries = np.vectorize(self.gap_function)(self.x_boundaries[1:-1])
 
     def gap_at_position(self, x: float) -> float:
         """
@@ -178,8 +171,7 @@ class SuperconductorGeometry:
 
 class BCSPhysics:
     """
-    Vectorized BCS theory calculations with Dynes broadening.
-    All public methods now operate on NumPy arrays.
+    Calculates normalized-density-of-states with Dynes broadening, Fermi-Dirac distribution for thermal quasiparticles, and occupation factor for thermal phonons.
     """
 
     def __init__(self, gamma: float, N_0: float):
@@ -189,11 +181,10 @@ class BCSPhysics:
     def density_of_states(self, E: np.ndarray, delta: float) -> np.ndarray:
         """
         Calculate normalized superconducting density of states with Dynes broadening.
-        This is a vectorized version of the Dynes DOS formula.
         """
         # Handle the ideal case (gamma=0) where DOS is zero below the gap
         if self.gamma == 0:
-            return np.where(E >= delta, E / np.sqrt(E**2 - delta**2), 0.0)
+            return np.where(E > delta, E / np.sqrt(E**2 - delta**2), 0.0)
 
         # Vectorized complex arithmetic for Dynes broadening
         E_complex = E - 1j * self.gamma
@@ -201,7 +192,7 @@ class BCSPhysics:
         arg = E_complex**2 - delta**2
         sqrt_arg = np.sqrt(arg)
 
-        # The original code's logic to ensure the correct branch cut, vectorized
+        # Ensure the correct branch cut
         fix_mask = sqrt_arg.real < 0
         sqrt_arg[fix_mask] = -sqrt_arg[fix_mask]
 
@@ -217,13 +208,12 @@ class BCSPhysics:
         k_B = pyc['Boltzmann constant in eV/K'][0]
         arg = E / (k_B * T)
 
-        # Use np.exp directly, which is naturally vectorized.
         # np.exp handles large arguments by returning inf.
         return 1.0 / (np.exp(arg) + 1.0)
 
     def phonon_occupation(self, E: np.ndarray, T: float) -> np.ndarray:
         """
-        Vectorized phonon occupation number N_p(E,T).
+        Phonon occupation number N_p(E,T).
         Handles phonon emission (E > 0) and absorption (E < 0).
         """
         # Handle zero temperature case first
@@ -267,7 +257,7 @@ class DiffusionSolver:
         Creation of the diffusion coefficient array D[boundary_idx, energy_idx].
         """
         # Get gap values at all interior boundaries, shape (nx-1)
-        delta_vals = self.geometry.delta_at_inner_boundaries()
+        delta_vals = self.geometry.delta_at_inner_boundaries
 
         # Use broadcasting to compute D for all boundaries and energies simultaneously
         # energies shape -> (1, ne)
@@ -384,11 +374,9 @@ class DiffusionSolver:
             
         return x
 
-# Assume MaterialParameters, SuperconductorGeometry, BCSPhysics, and logger are defined
-class ScatteringSolver:
+class CollisionSolver:
     """
     Handles energy relaxation through scattering and recombination.
-    This version is fully vectorized for high performance.
     """
 
     def __init__(self, material: MaterialParameters, geometry: SuperconductorGeometry,
@@ -403,18 +391,15 @@ class ScatteringSolver:
 
     def create_scattering_arrays(self, energies: np.ndarray) -> None:
         """
-        Create scattering and recombination kernel arrays using vectorized operations.
-
-        NOTE: This implementation assumes the geometry object can provide the entire
-        gap profile as a single array, e.g., `self.geometry.gap_profile`.
+        Create scattering and recombination kernel arrays.
         """
         nx = self.geometry.nx
         ne = len(energies)
         k_B = pyc['Boltzmann constant in eV/K'][0]
 
         # Material constants for the kernels
-        Ks_const = 1.0 / (self.material.tau_s * (k_B * self.material.T_c) ** 3)
-        Kr_const = 1.0 / (self.material.tau_r * (k_B * self.material.T_c) ** 3)
+        Ks_const = 1.0 / (self.material.tau_0 * (k_B * self.material.T_c) ** 3)
+        Kr_const = 1.0 / (self.material.tau_0 * (k_B * self.material.T_c) ** 3)
 
         # Vectorized Kernel Calculation 
 
@@ -431,7 +416,6 @@ class ScatteringSolver:
         # 3. Calculate position-independent Phonon Occupation matrices, shape (ne, ne)
         N_diff = self.bcs.phonon_occupation(E_diff, self.T_bath)
         N_sum = self.bcs.phonon_occupation(E_sum, self.T_bath)
-
 
         # 4. Use broadcasting to compute kernels for all spatial points at once
         delta_sq = deltas[:, None, None]**2
@@ -505,9 +489,9 @@ class ScatteringSolver:
         Ks = self._Ks_array
         Kr = self._Kr_array
 
-        scatter_in = rho[:, :, None] * (Ks.transpose(0, 2, 1) @ n) * pauli[:, :, None]
+        scatter_in = rho[:, :, None] * (Ks.transpose(0, 2, 1) @ n) * pauli[:, :, None] #(0,2,1) means keep axis 0, swap axes 1 and 2
 
-        scatter_out_rates = np.einsum('xjk,xk,xk->xj', Ks, rho, pauli)
+        scatter_out_rates = np.einsum('xjk,xk,xk->xj', Ks, rho, pauli) #any index appearing on the left but not on the right gets summed over; sum only over k
         scatter_out = scatter_out_rates[:, :, None] * n
 
         recomb_loss = 2 * (Kr @ n) * n
@@ -642,12 +626,7 @@ class QuasiparticleSimulator:
         self.geometry = SuperconductorGeometry(sim_params.L, sim_params.nx, gap_function)
         self.bcs = BCSPhysics(material.gamma, N_0=material.N_0)
         self.diffusion = DiffusionSolver(self.geometry, material.D_0)
-        self.scattering = ScatteringSolver(material, self.geometry, self.bcs, T_bath)
-        
-        # Pass solver parameters to ScatteringSolver for use in implicit solver
-        self.scattering.verbose = sim_params.verbose
-        self.scattering.rtol = sim_params.rtol
-        self.scattering.atol = sim_params.atol
+        self.collision = CollisionSolver(material, self.geometry, self.bcs, T_bath)
         
         self.monitor = SystemMonitor(sim_params.dx, sim_params.dE)
     
@@ -670,7 +649,7 @@ class QuasiparticleSimulator:
         cfl_limit = 0.5 * dx ** 2 / D_max
 
         if dt > cfl_limit:
-            warnings.warn(f"""Time step ({dt:.3e} ns) exceeds the CFL stability limit ({cfl_limit:.3e} ns). The Crank-Nicolson algorithm ensures stability, but unphysical oscillations may stilloccur. Consider reducing the time step or increasing spatial resolution.""")
+            warnings.warn(f"""Time step ({dt:.3e} ns) exceeds the CFL stability limit ({cfl_limit:.3e} ns). The Crank-Nicolson algorithm ensures stability, but unphysical oscillations may still occur. Consider reducing the time step or increasing spatial resolution.""")
             
     def initialize(self, init_type: str = 'thermal', uniform_density: float = 1e-10):
         """
@@ -707,51 +686,17 @@ class QuasiparticleSimulator:
         self.diffusion.create_diffusion_array(self.energies)
         alpha = 2 * self.sim_params.dx**2 / self.sim_params.dt
         self.diffusion.create_thomas_factors(alpha)
-        self.scattering.create_scattering_arrays(self.energies)
+        self.collision.create_scattering_arrays(self.energies)
 
         # --- Logging and info ---
         total_qps = 4 * self.material.N_0 * np.sum(self.n_density) * \
                     self.sim_params.dx * self.sim_params.dE
-        logger.info(f"Vectorized initialization with '{init_type}' distribution complete.")
+        logger.info(f"Initialization with '{init_type}' distribution complete.")
         logger.info(f"Total QPs = {total_qps:.2e}")
         
     def inject_quasiparticles(self, injection, time: float):
-        """Inject quasiparticles at a specified location and energy.
-        This function converts the provided physical injection rate into the
-        internal dimensionless units used by the simulation.
-        """
+        """Inject quasiparticles at a specified location and energy with Pauli exclusion checking."""
         inject_quasiparticles_safe(self, injection, time)
-        if injection.rate <= 0:
-            return
-            
-        # Find closest spatial index
-        ix = np.argmin(np.abs(self.geometry.x_centers - injection.location))
-        
-        # Find closest energy index
-        ie = np.argmin(np.abs(self.energies - injection.energy))
-        
-        # Check if injection is valid at this location
-        delta = self.geometry.gap_at_position(self.geometry.x_centers[ix])
-        if self.energies[ie] < delta and self.material.gamma == 0:
-            logger.warning(f"Cannot inject below gap at x={injection.location:.1f} μm")
-            return
-            
-        # Determine if we should inject
-        inject_now = False
-        if injection.type == 'continuous':
-            inject_now = True
-        elif injection.type == 'pulse':
-            inject_now = time <= injection.pulse_duration
-            
-        if inject_now:
-            # Convert injection rate to dimensionless density rate
-            # injection.rate is in QPs/μm/eV/ns
-            # Need to convert to dimensionless: divide by 4N₀
-            rho = self.scattering._rho_array[ix, ie]
-            if rho > 1e-15:
-                dimensionless_rate = injection.rate / (4 * self.material.N_0)
-                density_to_add = dimensionless_rate * self.sim_params.dt
-                self.n_density[ix, ie] += density_to_add
             
     def step(self):
         """Perform one complete time step"""
@@ -762,22 +707,27 @@ class QuasiparticleSimulator:
         self.diffusion.diffusion_step(self.n_density, dt)
         
         # Scattering step (this method returns a new array)
-        self.n_density = self.scattering.scattering_step(self.n_density, self.n_thermal, dt, dE)
+        self.n_density = self.collision.scattering_step(self.n_density, self.n_thermal, dt, dE)
         
     def run(self, injection: Optional[InjectionParameters] = None,
             plot_interval: int = 100, save_data: bool = False):
         """Run the complete simulation"""
         
-        logger.info("Starting simulation with Pauli blocking...")
+        logger.info("Starting simulation...")
         logger.info(f"Using dimensionless density representation: n(x,E)")
-        
+
+        # Use tqdm if verbose mode is enabled
+        time_iterator = range(self.sim_params.nt + 1)
+        if self.sim_params.verbose:
+            time_iterator = tqdm(time_iterator, desc="Simulation Progress")
+            
         for it in range(self.sim_params.nt + 1):
             time = it * self.sim_params.dt
             
             # Monitor conservation with occupation factor diagnostics
             if it % plot_interval == 0:
                 # Calculate occupation factors for monitoring
-                occupation_factors = self.scattering._calculate_occupation_factors(self.n_density)
+                occupation_factors = self.collision._calculate_occupation_factors(self.n_density)
                 
                 metrics = self.monitor.check_system(
                     self.n_density, occupation_factors, self.energies, 
@@ -832,7 +782,7 @@ class QuasiparticleSimulator:
         axes[0,0].set_title(f'log₁₀(n) at t={time:.1f} ns')
         
         # Gap profile
-        gap_profile = self.geometry.gap_array()
+        gap_profile = self.geometry.gap_at_center
         axes[0,0].plot(self.geometry.x_centers, gap_profile, 'w--', 
                        label='Gap Δ(x)', linewidth=2)
         axes[0,0].legend()
@@ -896,7 +846,7 @@ class QuasiparticleSimulator:
     def save_snapshot(self, time: float):
         """Save current state to file including occupation factors"""
         # Calculate occupation factors for saving
-        occupation_factors = self.scattering._calculate_occupation_factors(self.n_density)
+        occupation_factors = self.collision._calculate_occupation_factors(self.n_density)
         
         filename = f"qp_density_pauli_t{time:.1f}ns.npz"
         np.savez(filename,
@@ -906,7 +856,7 @@ class QuasiparticleSimulator:
                  time=time,
                  x_centers=self.geometry.x_centers,
                  energies=self.energies,
-                 gap_profile=self.geometry.gap_array(),
+                 gap_profile=self.geometry.gap_at_center,
                  N_0=self.material.N_0,  # For unit conversion
                  units="dimensionless n(E,x) = ρ(E,x)f(E,x)")
         logger.info(f"Saved snapshot with Pauli blocking data to {filename}")
@@ -969,7 +919,7 @@ def inject_quasiparticles_safe(simulator, injection, time: float):
     
     # Check current state
     current_density = simulator.n_density[ix, ie]
-    rho = simulator.scattering._rho_array[ix, ie] if simulator.scattering._rho_array is not None else 1.0
+    rho = simulator.collision._rho_array[ix, ie] if simulator.collision._rho_array is not None else 1.0
     
     if rho <= 1e-15:
         logger.warning(f"Cannot inject at energy below gap: E={simulator.energies[ie]*1e6:.1f} μeV")
@@ -1019,6 +969,10 @@ def inject_quasiparticles_safe(simulator, injection, time: float):
     simulator.n_density[ix, ie] += density_to_add
     logger.debug(f"Safe injection: added {density_to_add:.2e} (dimensionless) at ({ix},{ie}), f = {target_occupation:.3f}")
 
+# ============================================================================
+# Utility Functions
+# ============================================================================
+
 def calculate_safe_injection_rate(simulator, injection_energy: float, injection_location: float,
                                  target_qps: float, safety_factor: float = 0.9) -> float:
     """
@@ -1048,7 +1002,7 @@ def calculate_safe_injection_rate(simulator, injection_energy: float, injection_
     
     # Get current state
     current_density = simulator.n_density[ix, ie]
-    rho = simulator.scattering._rho_array[ix, ie] if simulator.scattering._rho_array is not None else \
+    rho = simulator.collision._rho_array[ix, ie] if simulator.collision._rho_array is not None else \
           simulator.bcs.density_of_states(injection_energy, simulator.geometry.gap_at_position(simulator.geometry.x_centers[ix]))
     
     if rho <= 1e-15:
@@ -1087,8 +1041,6 @@ def validate_injection_parameters(simulator, injection) -> dict:
     
     Returns detailed analysis of injection feasibility.
     """
-    from qp_simulator import InjectionParameters
-    
     # Find injection cell
     ix = np.argmin(np.abs(simulator.geometry.x_centers - injection.location))
     ie = np.argmin(np.abs(simulator.energies - injection.energy))
@@ -1111,7 +1063,7 @@ def validate_injection_parameters(simulator, injection) -> dict:
     
     # Get current state
     current_density = simulator.n_density[ix, ie]
-    rho = simulator.scattering._rho_array[ix, ie] if simulator.scattering._rho_array is not None else \
+    rho = simulator.collision._rho_array[ix, ie] if simulator.collision._rho_array is not None else \
           simulator.bcs.density_of_states(injection.energy, delta)
     
     if rho <= 1e-15:
@@ -1160,28 +1112,6 @@ def validate_injection_parameters(simulator, injection) -> dict:
         results['recommendations'].append("Injection parameters are safe")
     
     return results
-
-# Enhanced QuasiparticleSimulator method (to replace existing inject_quasiparticles)
-def enhanced_inject_quasiparticles(self, injection, time: float, check_pauli: bool = True):
-    """
-    Enhanced injection with optional Pauli checking.
-    
-    Parameters:
-    -----------
-    injection : InjectionParameters
-        Injection parameters
-    time : float
-        Current time (ns)
-    check_pauli : bool
-        If True, performs Pauli exclusion checking (default: True)
-        If False, uses original behavior (for legacy compatibility)
-    """
-    if check_pauli:
-        inject_quasiparticles_safe(self, injection, time)
-    else:
-        # Original method (for comparison/testing)
-        self._inject_quasiparticles_original(injection, time)
-
 
 # ============================================================================
 # End of qp_simulator.py
